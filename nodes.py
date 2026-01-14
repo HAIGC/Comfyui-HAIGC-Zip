@@ -24,6 +24,8 @@ _ALLOWED_VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".gif"}
 _ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
 _ALLOWED_TEXT_EXTS = {".txt", ".json", ".srt", ".vtt", ".csv", ".md", ".log"}
 
+_IMAGE_NAME_QUEUE_BY_SIG: dict[tuple, list[str]] = {}
+
 
 def _safe_basename(name: str) -> str:
     name = name.replace("\\", "/")
@@ -252,22 +254,51 @@ def _read_zip_contents(zip_path: str):
 
                 img_np = np.array(rgb).astype(np.float32) / 255.0
                 img = torch.from_numpy(img_np)[None,]
-                images_seq.append({"idx": idx, "key": key, "image": img, "mask": mask.unsqueeze(0), "prompt": str(prompt_text or "")})
+                try:
+                    safe_member = _safe_zip_member_relpath(n)
+                except Exception:
+                    safe_member = _safe_basename(n)
+                sig_arr = np.clip(np.array(rgb), 0, 255).astype(np.uint8)
+                sig = (sig_arr.shape, hashlib.sha1(sig_arr.tobytes()).digest())
+                _IMAGE_NAME_QUEUE_BY_SIG.setdefault(sig, []).append(safe_member)
+                images_seq.append(
+                    {
+                        "idx": idx,
+                        "key": key,
+                        "image": img,
+                        "mask": mask.unsqueeze(0),
+                        "prompt": str(prompt_text or ""),
+                        "name": safe_member,
+                    }
+                )
                 continue
 
             if ext in _ALLOWED_VIDEO_EXTS:
                 try:
                     full = _extract_zip_member_to_dir(zf, n, extract_root)
-                    videos_seq.append({"idx": idx, "key": key, "video": VideoFromFile(full)})
+                    v = VideoFromFile(full)
+                    try:
+                        safe_member = _safe_zip_member_relpath(n)
+                    except Exception:
+                        safe_member = _safe_basename(n)
+                    try:
+                        setattr(v, "__haigc_zip_member", safe_member)
+                    except Exception:
+                        pass
+                    videos_seq.append({"idx": idx, "key": key, "video": v, "name": safe_member})
                 except Exception as e:
                     texts_seq.append({"idx": idx, "key": key, "text": f"{n}\n视频读取失败: {e}"})
                 continue
 
             if ext in _ALLOWED_AUDIO_EXTS:
                 try:
+                    try:
+                        safe_member = _safe_zip_member_relpath(n)
+                    except Exception:
+                        safe_member = _safe_basename(n)
+                    raw = zf.read(n)
                     if ext == ".wav":
-                        raw = zf.read(n)
-                        audios_seq.append({"idx": idx, "key": key, "audio": _wav_bytes_to_audio(raw)})
+                        aud = _wav_bytes_to_audio(raw)
                     else:
                         if soundfile is None:
                             raise RuntimeError("缺少 soundfile，无法解码该音频格式")
@@ -276,7 +307,11 @@ def _read_zip_contents(zip_path: str):
                         a = np.asarray(data, dtype=np.float32).T
                         a = np.clip(a, -1.0, 1.0)
                         waveform = torch.from_numpy(a).float().unsqueeze(0)
-                        audios_seq.append({"idx": idx, "key": key, "audio": {"waveform": waveform, "sample_rate": int(sr)}})
+                        aud = {"waveform": waveform, "sample_rate": int(sr)}
+                    if isinstance(aud, dict):
+                        aud["__haigc_zip_member"] = safe_member
+                        aud["__haigc_zip_bytes"] = raw
+                    audios_seq.append({"idx": idx, "key": key, "audio": aud, "name": safe_member})
                 except Exception as e:
                     texts_seq.append({"idx": idx, "key": key, "text": f"{n}\n音频读取失败: {e}"})
                 continue
@@ -286,7 +321,18 @@ def _read_zip_contents(zip_path: str):
                     text = zf.read(n).decode("utf-8", errors="ignore")
                 except Exception as e:
                     text = f"{n}\n文本读取失败: {e}"
-                texts_seq.append({"idx": idx, "key": key, "text": text if text.startswith(f"{n}\n") else f"{n}\n{text}"})
+                try:
+                    safe_member = _safe_zip_member_relpath(n)
+                except Exception:
+                    safe_member = _safe_basename(n)
+                texts_seq.append(
+                    {
+                        "idx": idx,
+                        "key": key,
+                        "text": text if text.startswith(f"{safe_member}\n") else f"{safe_member}\n{text}",
+                        "name": safe_member,
+                    }
+                )
                 continue
 
         if len(images_seq) == 0 and len(videos_seq) == 0 and len(audios_seq) == 0 and len(texts_seq) == 0:
@@ -396,6 +442,7 @@ def _read_zip_contents(zip_path: str):
         output_videos: list[object] = []
         output_audios: list[dict] = []
         output_texts: list[str] = []
+        output_naming = {"images": [], "videos": [], "audios": [], "texts": []}
 
         for b in batches:
             img_it = b.get("image", None)
@@ -403,20 +450,24 @@ def _read_zip_contents(zip_path: str):
                 output_images.append(img_it["image"])
                 output_masks.append(img_it["mask"])
                 output_prompts.append(str(img_it.get("prompt", "") or ""))
+                output_naming["images"].append(str(img_it.get("name", "") or ""))
 
             vid_it = b.get("video", None)
             if vid_it is not None:
                 output_videos.append(vid_it["video"])
+                output_naming["videos"].append(str(vid_it.get("name", "") or ""))
 
             aud_it = b.get("audio", None)
             if aud_it is not None:
                 output_audios.append(aud_it["audio"])
+                output_naming["audios"].append(str(aud_it.get("name", "") or ""))
 
             txt_it = b.get("text", None)
             if txt_it is not None:
                 output_texts.append(str(txt_it.get("text", "") or ""))
+                output_naming["texts"].append(str(txt_it.get("name", "") or ""))
 
-        return output_images, output_masks, output_prompts, output_videos, output_audios, output_texts
+        return output_images, output_masks, output_prompts, output_videos, output_audios, output_texts, output_naming
 
 
 class HAIGC_LoadImagesFromZip:
@@ -428,10 +479,10 @@ class HAIGC_LoadImagesFromZip:
         return {"required": {"zip_file": (files, {"zip_upload": True})}}
 
     CATEGORY = "HAIGC/Zip"
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "VIDEO", "AUDIO", "STRING")
-    RETURN_NAMES = ("图像", "遮罩", "提示词", "视频", "音频", "文本")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "VIDEO", "AUDIO", "STRING", "*")
+    RETURN_NAMES = ("图像", "遮罩", "提示词", "视频", "音频", "文本", "命名信息")
     FUNCTION = "load_zip"
-    OUTPUT_IS_LIST = (True, True, True, True, True, True)
+    OUTPUT_IS_LIST = (True, True, True, True, True, True, False)
 
     def load_zip(self, zip_file: str):
         if not zip_file:
@@ -727,6 +778,7 @@ class HAIGC_SaveImagesToZip:
         self._written_files = 0
         self._seen_images = set()
         self._seen_files = set()
+        self._seen_arcnames = set()
         self._ui_emitted = False
         self._last_call_ts = 0.0
 
@@ -735,6 +787,7 @@ class HAIGC_SaveImagesToZip:
         return {
             "optional": {
                 "zip": ("*",),
+                "命名信息": ("*",),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -812,6 +865,7 @@ class HAIGC_SaveImagesToZip:
         self,
         zip=None,
         images=None,
+        命名信息=None,
         prompt=None,
         extra_pnginfo=None,
         **kwargs,
@@ -824,6 +878,25 @@ class HAIGC_SaveImagesToZip:
 
         if zip is None:
             return {"ui": {"images": []}}
+
+        def _as_list(v):
+            if v is None:
+                return []
+            if isinstance(v, (list, tuple)):
+                return list(v)
+            return [v]
+
+        def _parse_naming(v):
+            if v is None:
+                return None
+            if isinstance(v, dict):
+                return {
+                    "images": _as_list(v.get("images", None) or v.get("图像", None) or v.get("image_names", None) or v.get("图像文件名", None)),
+                    "videos": _as_list(v.get("videos", None) or v.get("视频", None) or v.get("video_names", None) or v.get("视频文件名", None)),
+                    "audios": _as_list(v.get("audios", None) or v.get("音频", None) or v.get("audio_names", None) or v.get("音频文件名", None)),
+                    "texts": _as_list(v.get("texts", None) or v.get("文本", None) or v.get("text_names", None) or v.get("文本文件名", None)),
+                }
+            return None
 
         try:
             marker_obj = {
@@ -841,7 +914,7 @@ class HAIGC_SaveImagesToZip:
         run_key = hashlib.sha256(marker_json).hexdigest()[:16]
 
         now = time.time()
-        if run_key != self._run_key or (now - self._last_call_ts) > 2.0:
+        if run_key != self._run_key or (now - self._last_call_ts) > 60.0:
             self._run_key = run_key
             self._zip_info = None
             self._written_any = 0
@@ -852,8 +925,22 @@ class HAIGC_SaveImagesToZip:
             self._written_files = 0
             self._seen_images = set()
             self._seen_files = set()
+            self._seen_arcnames = set()
+            self._name_queue_images = []
+            self._name_queue_videos = []
+            self._name_queue_audios = []
+            self._name_queue_texts = []
             self._ui_emitted = False
         self._last_call_ts = now
+
+        if not hasattr(self, "_name_ctx_set") or self._name_ctx_set != run_key:
+            naming = _parse_naming(命名信息)
+            if naming is not None:
+                self._name_queue_images = [str(x) for x in naming.get("images", []) if str(x).strip() != ""]
+                self._name_queue_videos = [str(x) for x in naming.get("videos", []) if str(x).strip() != ""]
+                self._name_queue_audios = [str(x) for x in naming.get("audios", []) if str(x).strip() != ""]
+                self._name_queue_texts = [str(x) for x in naming.get("texts", []) if str(x).strip() != ""]
+            self._name_ctx_set = run_key
 
         if self._zip_info is None:
             def _peek_dimensions(v):
@@ -940,13 +1027,51 @@ class HAIGC_SaveImagesToZip:
                     i = 255.0 * one[0].detach().to(device="cpu").numpy()
                     arr = np.clip(i, 0, 255).astype(np.uint8)
                     sig = (arr.shape, hashlib.sha1(arr.tobytes()).digest())
-                    if sig in self._seen_images:
-                        continue
-                    self._seen_images.add(sig)
+                    orig_name = None
+                    if hasattr(self, "_name_queue_images") and len(self._name_queue_images) > 0:
+                        orig_name = self._name_queue_images.pop(0)
+                    if orig_name is None:
+                        orig_queue = _IMAGE_NAME_QUEUE_BY_SIG.get(sig, None)
+                        if orig_queue is not None and len(orig_queue) > 0:
+                            orig_name = orig_queue.pop(0)
+                    if orig_name is None:
+                        if sig in self._seen_images:
+                            continue
+                        self._seen_images.add(sig)
                     img = Image.fromarray(arr)
                     buf = io.BytesIO()
-                    img.save(buf, format="PNG", pnginfo=metadata, compress_level=4)
-                    arcname = f"{filename_prefix}_{self._written_images:05}.png"
+                    arcname = None
+                    if orig_name:
+                        try:
+                            arcname = _safe_zip_member_relpath(str(orig_name).replace("\\", "/"))
+                        except Exception:
+                            arcname = _safe_basename(str(orig_name))
+                    if not arcname:
+                        arcname = f"{filename_prefix}_{self._written_images:05}.png"
+
+                    base, ext = os.path.splitext(arcname)
+                    ext_l = ext.lower()
+                    if ext_l in (".jpg", ".jpeg"):
+                        img.save(buf, format="JPEG", quality=95, subsampling=0)
+                    elif ext_l == ".webp":
+                        img.save(buf, format="WEBP", quality=95, method=4)
+                    elif ext_l in (".bmp", ".tif", ".tiff"):
+                        img.save(buf, format="PNG", pnginfo=metadata, compress_level=4)
+                        arcname = f"{base}.png"
+                    else:
+                        img.save(buf, format="PNG", pnginfo=metadata, compress_level=4)
+                        if ext == "":
+                            arcname = f"{arcname}.png"
+
+                    if arcname in self._seen_arcnames:
+                        n = 2
+                        while True:
+                            cand = f"{base}_dup{n}{os.path.splitext(arcname)[1]}"
+                            if cand not in self._seen_arcnames:
+                                arcname = cand
+                                break
+                            n += 1
+                    self._seen_arcnames.add(arcname)
                     zf.writestr(arcname, buf.getvalue())
                     self._written_images += 1
                     self._written_any += 1
@@ -954,33 +1079,112 @@ class HAIGC_SaveImagesToZip:
             def _write_video_obj(v):
                 if not hasattr(v, "save_to"):
                     return
+                orig_name = getattr(v, "__haigc_zip_member", None)
+                if orig_name is None and hasattr(self, "_name_queue_videos") and len(self._name_queue_videos) > 0:
+                    orig_name = self._name_queue_videos.pop(0)
+                source_path = getattr(v, "_VideoFromFile__file", None)
+                arcname = None
+                if orig_name:
+                    try:
+                        arcname = _safe_zip_member_relpath(str(orig_name).replace("\\", "/"))
+                    except Exception:
+                        arcname = _safe_basename(str(orig_name))
+
+                if arcname and isinstance(source_path, str) and os.path.isfile(source_path):
+                    base, ext = os.path.splitext(arcname)
+                    if arcname in self._seen_arcnames:
+                        n = 2
+                        while True:
+                            cand = f"{base}_dup{n}{ext}"
+                            if cand not in self._seen_arcnames:
+                                arcname = cand
+                                break
+                            n += 1
+                    self._seen_arcnames.add(arcname)
+                    zf.write(source_path, arcname=arcname)
+                    self._written_videos += 1
+                    self._written_any += 1
+                    return
+
                 buf = io.BytesIO()
                 v.save_to(buf, metadata=video_metadata)
                 data = buf.getvalue()
-                fmt = None
-                if hasattr(v, "get_container_format"):
-                    try:
-                        fmt = str(v.get_container_format()).lower()
-                    except Exception:
-                        fmt = None
-                ext = "mp4"
-                if fmt:
-                    if "webm" in fmt:
-                        ext = "webm"
-                    elif "matroska" in fmt:
-                        ext = "mkv"
-                    elif "avi" in fmt:
-                        ext = "avi"
-                    elif "mp4" in fmt or "mov" in fmt:
-                        ext = "mp4"
-                arcname = f"{filename_prefix}_video_{self._written_videos:05}.{ext}"
+                if not arcname:
+                    fmt = None
+                    if hasattr(v, "get_container_format"):
+                        try:
+                            fmt = str(v.get_container_format()).lower()
+                        except Exception:
+                            fmt = None
+                    ext = "mp4"
+                    if fmt:
+                        if "webm" in fmt:
+                            ext = "webm"
+                        elif "matroska" in fmt:
+                            ext = "mkv"
+                        elif "avi" in fmt:
+                            ext = "avi"
+                        elif "mp4" in fmt or "mov" in fmt:
+                            ext = "mp4"
+                    arcname = f"{filename_prefix}_video_{self._written_videos:05}.{ext}"
+
+                base, ext = os.path.splitext(arcname)
+                if arcname in self._seen_arcnames:
+                    n = 2
+                    while True:
+                        cand = f"{base}_dup{n}{ext}"
+                        if cand not in self._seen_arcnames:
+                            arcname = cand
+                            break
+                        n += 1
+                self._seen_arcnames.add(arcname)
                 zf.writestr(arcname, data)
                 self._written_videos += 1
                 self._written_any += 1
 
             def _write_audio_obj(a):
+                orig_name = a.get("__haigc_zip_member", None) if isinstance(a, dict) else getattr(a, "__haigc_zip_member", None)
+                orig_bytes = a.get("__haigc_zip_bytes", None) if isinstance(a, dict) else getattr(a, "__haigc_zip_bytes", None)
+                if orig_name is None and hasattr(self, "_name_queue_audios") and len(self._name_queue_audios) > 0:
+                    orig_name = self._name_queue_audios.pop(0)
+                arcname = None
+                if orig_name:
+                    try:
+                        arcname = _safe_zip_member_relpath(str(orig_name).replace("\\", "/"))
+                    except Exception:
+                        arcname = _safe_basename(str(orig_name))
+                if arcname and isinstance(orig_bytes, (bytes, bytearray)) and len(orig_bytes) > 0:
+                    base, ext = os.path.splitext(arcname)
+                    if arcname in self._seen_arcnames:
+                        n = 2
+                        while True:
+                            cand = f"{base}_dup{n}{ext}"
+                            if cand not in self._seen_arcnames:
+                                arcname = cand
+                                break
+                            n += 1
+                    self._seen_arcnames.add(arcname)
+                    zf.writestr(arcname, bytes(orig_bytes))
+                    self._written_audios += 1
+                    self._written_any += 1
+                    return
+
                 data = self._audio_to_wav_bytes(a)
-                arcname = f"{filename_prefix}_audio_{self._written_audios:05}.wav"
+                if arcname:
+                    base, _ = os.path.splitext(arcname)
+                    arcname = f"{base}.wav"
+                else:
+                    arcname = f"{filename_prefix}_audio_{self._written_audios:05}.wav"
+                base, ext = os.path.splitext(arcname)
+                if arcname in self._seen_arcnames:
+                    n = 2
+                    while True:
+                        cand = f"{base}_dup{n}{ext}"
+                        if cand not in self._seen_arcnames:
+                            arcname = cand
+                            break
+                        n += 1
+                self._seen_arcnames.add(arcname)
                 zf.writestr(arcname, data)
                 self._written_audios += 1
                 self._written_any += 1
@@ -991,8 +1195,40 @@ class HAIGC_SaveImagesToZip:
                 s = str(s)
                 if s.strip() == "":
                     return
-                data = s.encode("utf-8")
-                arcname = f"{filename_prefix}_text_{self._written_texts:05}.txt"
+                queued_name = None
+                if hasattr(self, "_name_queue_texts") and len(self._name_queue_texts) > 0:
+                    queued_name = self._name_queue_texts.pop(0)
+                arcname = None
+                body = s
+                parts = s.split("\n", 1)
+                if len(parts) == 2:
+                    head = parts[0].strip()
+                    ext = os.path.splitext(head)[1].lower()
+                    if ext in _ALLOWED_TEXT_EXTS or "/" in head or "\\" in head:
+                        try:
+                            arcname = _safe_zip_member_relpath(head.replace("\\", "/"))
+                        except Exception:
+                            arcname = _safe_basename(head)
+                        body = parts[1]
+                if not arcname:
+                    if queued_name:
+                        try:
+                            arcname = _safe_zip_member_relpath(str(queued_name).replace("\\", "/"))
+                        except Exception:
+                            arcname = _safe_basename(str(queued_name))
+                    if not arcname:
+                        arcname = f"{filename_prefix}_text_{self._written_texts:05}.txt"
+                base, ext = os.path.splitext(arcname)
+                if arcname in self._seen_arcnames:
+                    n = 2
+                    while True:
+                        cand = f"{base}_dup{n}{ext}"
+                        if cand not in self._seen_arcnames:
+                            arcname = cand
+                            break
+                        n += 1
+                self._seen_arcnames.add(arcname)
+                data = str(body).encode("utf-8")
                 zf.writestr(arcname, data)
                 self._written_texts += 1
                 self._written_any += 1
