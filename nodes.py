@@ -186,11 +186,11 @@ def _read_zip_contents(zip_path: str):
             stem = os.path.splitext(base)[0]
             return f"{dir_prefix}{stem}"
 
-        def _empty_audio() -> dict:
-            return {"waveform": torch.zeros((1, 1, 0), dtype=torch.float32), "sample_rate": 1}
-
-        placeholder_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
-        placeholder_mask = torch.zeros((1, 1, 1), dtype=torch.float32)
+        def _safe_member_name(member: str) -> str:
+            try:
+                return _safe_zip_member_relpath(member)
+            except Exception:
+                return _safe_basename(member)
 
         images_seq: list[dict] = []
         videos_seq: list[dict] = []
@@ -207,132 +207,32 @@ def _read_zip_contents(zip_path: str):
                 stem = os.path.splitext(base)[0]
                 if stem.endswith("_mask"):
                     continue
-                try:
-                    raw = zf.read(n)
-                    pil = node_helpers.pillow(Image.open, io.BytesIO(raw))
-                    pil = node_helpers.pillow(ImageOps.exif_transpose, pil)
-                except Exception as e:
-                    raise RuntimeError(f"读取图片失败: {_safe_basename(n)} ({e})")
-
-                if pil.mode == "I":
-                    pil = pil.point(lambda i: i * (1 / 255))
-
-                rgb = pil.convert("RGB")
-
                 dir_prefix = n[: n.rfind("/") + 1] if "/" in n else ""
-                stem, ext2 = os.path.splitext(_safe_basename(n))
-                mask_name = f"{dir_prefix}{stem}_mask{ext2}"
-                txt_name = f"{dir_prefix}{stem}.txt"
-
-                if mask_name in name_set:
-                    try:
-                        mask_raw = zf.read(mask_name)
-                        mask_pil = node_helpers.pillow(Image.open, io.BytesIO(mask_raw))
-                        mask_pil = node_helpers.pillow(ImageOps.exif_transpose, mask_pil)
-                        mask_pil = mask_pil.convert("L")
-                    except Exception as e:
-                        raise RuntimeError(f"读取遮罩失败: {_safe_basename(mask_name)} ({e})")
-
-                    if mask_pil.size != rgb.size:
-                        mask_pil = mask_pil.resize(rgb.size, resample=Image.NEAREST)
-                    mask_np = np.array(mask_pil).astype(np.float32) / 255.0
-                    mask = torch.from_numpy(mask_np)
-                elif "A" in pil.getbands() or (pil.mode == "P" and "transparency" in pil.info):
-                    rgba = pil.convert("RGBA")
-                    mask_np = np.array(rgba.getchannel("A")).astype(np.float32) / 255.0
-                    mask = 1.0 - torch.from_numpy(mask_np)
-                else:
-                    mask = torch.zeros((rgb.size[1], rgb.size[0]), dtype=torch.float32, device="cpu")
-
-                if txt_name in name_set:
-                    try:
-                        prompt_text = zf.read(txt_name).decode("utf-8", errors="ignore").strip()
-                    except Exception:
-                        prompt_text = ""
-                else:
-                    prompt_text = ""
-
-                img_np = np.array(rgb).astype(np.float32) / 255.0
-                img = torch.from_numpy(img_np)[None,]
-                try:
-                    safe_member = _safe_zip_member_relpath(n)
-                except Exception:
-                    safe_member = _safe_basename(n)
-                sig_arr = np.clip(np.array(rgb), 0, 255).astype(np.uint8)
-                sig = (sig_arr.shape, hashlib.sha1(sig_arr.tobytes()).digest())
-                _IMAGE_NAME_QUEUE_BY_SIG.setdefault(sig, []).append(safe_member)
+                stem2, ext2 = os.path.splitext(_safe_basename(n))
+                mask_name = f"{dir_prefix}{stem2}_mask{ext2}"
+                txt_name = f"{dir_prefix}{stem2}.txt"
                 images_seq.append(
                     {
                         "idx": idx,
                         "key": key,
-                        "image": img,
-                        "mask": mask.unsqueeze(0),
-                        "prompt": str(prompt_text or ""),
-                        "name": safe_member,
+                        "member": n,
+                        "mask_member": mask_name if mask_name in name_set else "",
+                        "txt_member": txt_name if txt_name in name_set else "",
+                        "name": _safe_member_name(n),
                     }
                 )
                 continue
 
             if ext in _ALLOWED_VIDEO_EXTS:
-                try:
-                    full = _extract_zip_member_to_dir(zf, n, extract_root)
-                    v = VideoFromFile(full)
-                    try:
-                        safe_member = _safe_zip_member_relpath(n)
-                    except Exception:
-                        safe_member = _safe_basename(n)
-                    try:
-                        setattr(v, "__haigc_zip_member", safe_member)
-                    except Exception:
-                        pass
-                    videos_seq.append({"idx": idx, "key": key, "video": v, "name": safe_member})
-                except Exception as e:
-                    texts_seq.append({"idx": idx, "key": key, "text": f"{n}\n视频读取失败: {e}"})
+                videos_seq.append({"idx": idx, "key": key, "member": n, "name": _safe_member_name(n)})
                 continue
 
             if ext in _ALLOWED_AUDIO_EXTS:
-                try:
-                    try:
-                        safe_member = _safe_zip_member_relpath(n)
-                    except Exception:
-                        safe_member = _safe_basename(n)
-                    raw = zf.read(n)
-                    if ext == ".wav":
-                        aud = _wav_bytes_to_audio(raw)
-                    else:
-                        if soundfile is None:
-                            raise RuntimeError("缺少 soundfile，无法解码该音频格式")
-                        full = _extract_zip_member_to_dir(zf, n, extract_root)
-                        data, sr = soundfile.read(full, always_2d=True, dtype="float32")
-                        a = np.asarray(data, dtype=np.float32).T
-                        a = np.clip(a, -1.0, 1.0)
-                        waveform = torch.from_numpy(a).float().unsqueeze(0)
-                        aud = {"waveform": waveform, "sample_rate": int(sr)}
-                    if isinstance(aud, dict):
-                        aud["__haigc_zip_member"] = safe_member
-                        aud["__haigc_zip_bytes"] = raw
-                    audios_seq.append({"idx": idx, "key": key, "audio": aud, "name": safe_member})
-                except Exception as e:
-                    texts_seq.append({"idx": idx, "key": key, "text": f"{n}\n音频读取失败: {e}"})
+                audios_seq.append({"idx": idx, "key": key, "member": n, "name": _safe_member_name(n), "ext": ext})
                 continue
 
             if ext in _ALLOWED_TEXT_EXTS:
-                try:
-                    text = zf.read(n).decode("utf-8", errors="ignore")
-                except Exception as e:
-                    text = f"{n}\n文本读取失败: {e}"
-                try:
-                    safe_member = _safe_zip_member_relpath(n)
-                except Exception:
-                    safe_member = _safe_basename(n)
-                texts_seq.append(
-                    {
-                        "idx": idx,
-                        "key": key,
-                        "text": text if text.startswith(f"{safe_member}\n") else f"{safe_member}\n{text}",
-                        "name": safe_member,
-                    }
-                )
+                texts_seq.append({"idx": idx, "key": key, "member": n, "name": _safe_member_name(n)})
                 continue
 
         if len(images_seq) == 0 and len(videos_seq) == 0 and len(audios_seq) == 0 and len(texts_seq) == 0:
@@ -447,25 +347,113 @@ def _read_zip_contents(zip_path: str):
         for b in batches:
             img_it = b.get("image", None)
             if img_it is not None:
-                output_images.append(img_it["image"])
-                output_masks.append(img_it["mask"])
-                output_prompts.append(str(img_it.get("prompt", "") or ""))
-                output_naming["images"].append(str(img_it.get("name", "") or ""))
+                n = str(img_it.get("member", "") or "")
+                try:
+                    raw = zf.read(n)
+                    pil = node_helpers.pillow(Image.open, io.BytesIO(raw))
+                    pil = node_helpers.pillow(ImageOps.exif_transpose, pil)
+                except Exception as e:
+                    raise RuntimeError(f"读取图片失败: {_safe_basename(n)} ({e})")
+
+                if pil.mode == "I":
+                    pil = pil.point(lambda i: i * (1 / 255))
+
+                rgb = pil.convert("RGB")
+                mask_member = str(img_it.get("mask_member", "") or "")
+                if mask_member:
+                    try:
+                        mask_raw = zf.read(mask_member)
+                        mask_pil = node_helpers.pillow(Image.open, io.BytesIO(mask_raw))
+                        mask_pil = node_helpers.pillow(ImageOps.exif_transpose, mask_pil)
+                        mask_pil = mask_pil.convert("L")
+                    except Exception as e:
+                        raise RuntimeError(f"读取遮罩失败: {_safe_basename(mask_member)} ({e})")
+                    if mask_pil.size != rgb.size:
+                        mask_pil = mask_pil.resize(rgb.size, resample=Image.NEAREST)
+                    mask_np = np.array(mask_pil).astype(np.float32) / 255.0
+                    mask = torch.from_numpy(mask_np)
+                elif "A" in pil.getbands() or (pil.mode == "P" and "transparency" in pil.info):
+                    rgba = pil.convert("RGBA")
+                    mask_np = np.array(rgba.getchannel("A")).astype(np.float32) / 255.0
+                    mask = 1.0 - torch.from_numpy(mask_np)
+                else:
+                    mask = torch.zeros((rgb.size[1], rgb.size[0]), dtype=torch.float32, device="cpu")
+
+                prompt_text = ""
+                txt_member = str(img_it.get("txt_member", "") or "")
+                if txt_member:
+                    try:
+                        prompt_text = zf.read(txt_member).decode("utf-8", errors="ignore").strip()
+                    except Exception:
+                        prompt_text = ""
+
+                img_np = np.array(rgb).astype(np.float32) / 255.0
+                img = torch.from_numpy(img_np)[None,]
+                safe_member = str(img_it.get("name", "") or "")
+                sig_arr = np.clip(np.array(rgb), 0, 255).astype(np.uint8)
+                sig = (sig_arr.shape, hashlib.sha1(sig_arr.tobytes()).digest())
+                _IMAGE_NAME_QUEUE_BY_SIG.setdefault(sig, []).append(safe_member)
+
+                output_images.append(img)
+                output_masks.append(mask.unsqueeze(0))
+                output_prompts.append(str(prompt_text or ""))
+                output_naming["images"].append(safe_member)
 
             vid_it = b.get("video", None)
             if vid_it is not None:
-                output_videos.append(vid_it["video"])
-                output_naming["videos"].append(str(vid_it.get("name", "") or ""))
+                n = str(vid_it.get("member", "") or "")
+                safe_member = str(vid_it.get("name", "") or "")
+                try:
+                    full = _extract_zip_member_to_dir(zf, n, extract_root)
+                    v = VideoFromFile(full)
+                    try:
+                        setattr(v, "__haigc_zip_member", safe_member)
+                    except Exception:
+                        pass
+                    output_videos.append(v)
+                    output_naming["videos"].append(safe_member)
+                except Exception as e:
+                    output_texts.append(f"{safe_member}\n视频读取失败: {e}")
+                    output_naming["texts"].append(safe_member)
 
             aud_it = b.get("audio", None)
             if aud_it is not None:
-                output_audios.append(aud_it["audio"])
-                output_naming["audios"].append(str(aud_it.get("name", "") or ""))
+                n = str(aud_it.get("member", "") or "")
+                safe_member = str(aud_it.get("name", "") or "")
+                ext = str(aud_it.get("ext", "") or "").lower()
+                try:
+                    raw = zf.read(n)
+                    if ext == ".wav":
+                        aud = _wav_bytes_to_audio(raw)
+                    else:
+                        if soundfile is None:
+                            raise RuntimeError("缺少 soundfile，无法解码该音频格式")
+                        full = _extract_zip_member_to_dir(zf, n, extract_root)
+                        data, sr = soundfile.read(full, always_2d=True, dtype="float32")
+                        a = np.asarray(data, dtype=np.float32).T
+                        a = np.clip(a, -1.0, 1.0)
+                        waveform = torch.from_numpy(a).float().unsqueeze(0)
+                        aud = {"waveform": waveform, "sample_rate": int(sr)}
+                    if isinstance(aud, dict):
+                        aud["__haigc_zip_member"] = safe_member
+                        aud["__haigc_zip_bytes"] = raw
+                    output_audios.append(aud)
+                    output_naming["audios"].append(safe_member)
+                except Exception as e:
+                    output_texts.append(f"{safe_member}\n音频读取失败: {e}")
+                    output_naming["texts"].append(safe_member)
 
             txt_it = b.get("text", None)
             if txt_it is not None:
-                output_texts.append(str(txt_it.get("text", "") or ""))
-                output_naming["texts"].append(str(txt_it.get("name", "") or ""))
+                n = str(txt_it.get("member", "") or "")
+                safe_member = str(txt_it.get("name", "") or "")
+                try:
+                    text = zf.read(n).decode("utf-8", errors="ignore")
+                except Exception as e:
+                    text = f"{safe_member}\n文本读取失败: {e}"
+                out_text = text if text.startswith(f"{safe_member}\n") else f"{safe_member}\n{text}"
+                output_texts.append(out_text)
+                output_naming["texts"].append(safe_member)
 
         return output_images, output_masks, output_prompts, output_videos, output_audios, output_texts, output_naming
 
@@ -476,24 +464,127 @@ class HAIGC_LoadImagesFromZip:
         files = _list_zip_files_in_input()
         if not files:
             files = [""]
-        return {"required": {"zip_file": (files, {"zip_upload": True})}}
+        if "" not in files:
+            files.append("")
+        return {
+            "required": {"zip_file": (files, {"zip_upload": True})},
+            "optional": {
+                "批处理游标": ("*",),
+                "加载": ("BOOLEAN", {"default": True}),
+            },
+        }
 
     CATEGORY = "HAIGC/Zip"
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "VIDEO", "AUDIO", "STRING", "*")
-    RETURN_NAMES = ("图像", "遮罩", "提示词", "视频", "音频", "文本", "命名信息")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "VIDEO", "AUDIO", "STRING", "*", "*")
+    RETURN_NAMES = ("图像", "遮罩", "提示词", "视频", "音频", "文本", "命名信息", "批处理游标")
     FUNCTION = "load_zip"
-    OUTPUT_IS_LIST = (True, True, True, True, True, True, False)
+    OUTPUT_IS_LIST = (True, True, True, True, True, True, False, False)
 
-    def load_zip(self, zip_file: str):
-        if not zip_file:
-            raise RuntimeError("请先上传或选择 ZIP 文件")
+    def load_zip(self, zip_file: str, 批处理游标=None, 加载: bool = True):
+        def _empty():
+            naming = {"images": [], "videos": [], "audios": [], "texts": []}
+            payload = {
+                "__haigc_chain_v1": True,
+                "images": [],
+                "masks": [],
+                "prompts": [],
+                "videos": [],
+                "audios": [],
+                "texts": [],
+                "naming": naming,
+            }
+            return [], [], [], [], [], [], naming, payload
+
+        def _parse_payload(v):
+            if not isinstance(v, dict):
+                return None
+            if v.get("__haigc_chain_v1") is not True:
+                return None
+            images = v.get("images", None)
+            masks = v.get("masks", None)
+            prompts = v.get("prompts", None)
+            videos = v.get("videos", None)
+            audios = v.get("audios", None)
+            texts = v.get("texts", None)
+            naming = v.get("naming", None)
+            if not isinstance(images, list) or not isinstance(masks, list) or not isinstance(prompts, list) or not isinstance(videos, list) or not isinstance(audios, list) or not isinstance(texts, list):
+                return None
+            if not isinstance(naming, dict):
+                naming = {"images": [], "videos": [], "audios": [], "texts": []}
+            return images, masks, prompts, videos, audios, texts, naming
+
+        parsed = _parse_payload(批处理游标)
+        if parsed is None:
+            acc_images, acc_masks, acc_prompts, acc_videos, acc_audios, acc_texts, acc_naming, _ = _empty()
+        else:
+            acc_images, acc_masks, acc_prompts, acc_videos, acc_audios, acc_texts, acc_naming = parsed
+            acc_naming = {
+                "images": list(acc_naming.get("images", []) or []),
+                "videos": list(acc_naming.get("videos", []) or []),
+                "audios": list(acc_naming.get("audios", []) or []),
+                "texts": list(acc_naming.get("texts", []) or []),
+            }
+
+        if not bool(加载):
+            payload = {
+                "__haigc_chain_v1": True,
+                "images": list(acc_images),
+                "masks": list(acc_masks),
+                "prompts": list(acc_prompts),
+                "videos": list(acc_videos),
+                "audios": list(acc_audios),
+                "texts": list(acc_texts),
+                "naming": acc_naming,
+            }
+            return list(acc_images), list(acc_masks), list(acc_prompts), list(acc_videos), list(acc_audios), list(acc_texts), acc_naming, payload
+
+        zip_file = str(zip_file or "")
+        if zip_file.strip() == "":
+            payload = {
+                "__haigc_chain_v1": True,
+                "images": list(acc_images),
+                "masks": list(acc_masks),
+                "prompts": list(acc_prompts),
+                "videos": list(acc_videos),
+                "audios": list(acc_audios),
+                "texts": list(acc_texts),
+                "naming": acc_naming,
+            }
+            return list(acc_images), list(acc_masks), list(acc_prompts), list(acc_videos), list(acc_audios), list(acc_texts), acc_naming, payload
+
         zip_file, zip_path = _resolve_zip_in_input(zip_file)
         if not os.path.isfile(zip_path):
             raise RuntimeError(f"找不到 ZIP 文件: {zip_file}")
-        return _read_zip_contents(zip_path)
+
+        out_images, out_masks, out_prompts, out_videos, out_audios, out_texts, out_naming = _read_zip_contents(zip_path)
+        combined_images = list(acc_images) + list(out_images)
+        combined_masks = list(acc_masks) + list(out_masks)
+        combined_prompts = list(acc_prompts) + list(out_prompts)
+        combined_videos = list(acc_videos) + list(out_videos)
+        combined_audios = list(acc_audios) + list(out_audios)
+        combined_texts = list(acc_texts) + list(out_texts)
+        combined_naming = {
+            "images": list(acc_naming.get("images", []) or []) + list((out_naming or {}).get("images", []) or []),
+            "videos": list(acc_naming.get("videos", []) or []) + list((out_naming or {}).get("videos", []) or []),
+            "audios": list(acc_naming.get("audios", []) or []) + list((out_naming or {}).get("audios", []) or []),
+            "texts": list(acc_naming.get("texts", []) or []) + list((out_naming or {}).get("texts", []) or []),
+        }
+        payload = {
+            "__haigc_chain_v1": True,
+            "images": combined_images,
+            "masks": combined_masks,
+            "prompts": combined_prompts,
+            "videos": combined_videos,
+            "audios": combined_audios,
+            "texts": combined_texts,
+            "naming": combined_naming,
+        }
+        return combined_images, combined_masks, combined_prompts, combined_videos, combined_audios, combined_texts, combined_naming, payload
 
     @classmethod
-    def IS_CHANGED(s, zip_file: str):
+    def IS_CHANGED(s, zip_file: str, **kwargs):
+        if not bool(kwargs.get("加载", True)):
+            return "disabled"
         try:
             _, zip_path = _resolve_zip_in_input(zip_file)
         except Exception:
@@ -504,7 +595,12 @@ class HAIGC_LoadImagesFromZip:
         return f"{st.st_mtime_ns}:{st.st_size}"
 
     @classmethod
-    def VALIDATE_INPUTS(s, zip_file: str):
+    def VALIDATE_INPUTS(s, zip_file: str, **kwargs):
+        if not bool(kwargs.get("加载", True)):
+            return True
+        cursor = kwargs.get("批处理游标", None)
+        if isinstance(cursor, dict) and cursor.get("__haigc_chain_v1") is True and (not zip_file or str(zip_file).strip() == ""):
+            return True
         if not zip_file:
             return "请先上传或选择 ZIP 文件"
         try:
